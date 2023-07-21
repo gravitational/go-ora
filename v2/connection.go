@@ -2,19 +2,21 @@ package go_ora
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/sijms/go-ora/v2/advanced_nego"
-	"github.com/sijms/go-ora/v2/converters"
-	"github.com/sijms/go-ora/v2/network"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/sijms/go-ora/v2/advanced_nego"
+	"github.com/sijms/go-ora/v2/converters"
+	"github.com/sijms/go-ora/v2/network"
 )
 
 type ConnectionState int
@@ -93,6 +95,7 @@ type OracleConnector struct {
 	drv           *OracleDriver
 	connectString string
 	dialer        network.DialerContext
+	tlsConfig     *tls.Config
 }
 type OracleDriver struct {
 	dataCollected  bool
@@ -121,7 +124,6 @@ func (drv *OracleDriver) OpenConnector(name string) (driver.Connector, error) {
 }
 
 func (connector *OracleConnector) Connect(ctx context.Context) (driver.Conn, error) {
-
 	conn, err := NewConnection(connector.connectString)
 	if err != nil {
 		return nil, err
@@ -129,6 +131,7 @@ func (connector *OracleConnector) Connect(ctx context.Context) (driver.Conn, err
 	conn.cusTyp = connector.drv.cusTyp
 
 	conn.connOption.Dialer = connector.dialer
+	conn.connOption.TLSConfig = connector.tlsConfig
 	err = conn.OpenWithContext(ctx)
 	if err != nil {
 		return nil, err
@@ -153,6 +156,10 @@ func (connector *OracleConnector) Driver() driver.Driver {
 
 func (connector *OracleConnector) Dialer(dialer network.DialerContext) {
 	connector.dialer = dialer
+}
+
+func (connector *OracleConnector) WithTLSConfig(tlsConfig *tls.Config) {
+	connector.tlsConfig = tlsConfig.Clone()
 }
 
 // Open return a new open connection
