@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -75,6 +76,7 @@ type ConnectionOption struct {
 	Failover     int
 	RetryTime    int
 	Lob          int
+	TLSConfig    *tls.Config
 }
 
 func extractServers(connStr string) ([]ServerAddr, error) {

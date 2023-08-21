@@ -59,6 +59,7 @@ type Session struct {
 	ClrChunkSize      int
 	breakConn         bool
 	resetConn         bool
+	tlsCert           *tls.Config
 	SSL               struct {
 		CertificateRequest []*x509.CertificateRequest
 		PrivateKeys        []*rsa.PrivateKey
@@ -256,13 +257,20 @@ func (session *Session) LoadSSLData(certs, keys, certRequests [][]byte) error {
 // used to create sslConn object
 func (session *Session) negotiate() {
 	connOption := session.Context.ConnOption
+	host := connOption.GetActiveServer(false)
+
+	if tlsConfig := session.Context.ConnOption.TLSConfig; tlsConfig != nil {
+		tlsConfig.ServerName = host.Addr
+		session.sslConn = tls.Client(session.conn, tlsConfig)
+		return
+	}
+
 	if session.SSL.roots == nil && len(session.SSL.Certificates) > 0 {
 		session.SSL.roots = x509.NewCertPool()
 		for _, cert := range session.SSL.Certificates {
 			session.SSL.roots.AddCert(cert)
 		}
 	}
-	host := connOption.GetActiveServer(false)
 	config := &tls.Config{
 		ServerName: host.Addr,
 	}
@@ -275,6 +283,7 @@ func (session *Session) negotiate() {
 	if !connOption.SSLVerify {
 		config.InsecureSkipVerify = true
 	}
+
 	session.sslConn = tls.Client(session.conn, config)
 }
 
