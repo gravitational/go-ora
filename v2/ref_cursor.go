@@ -2,7 +2,8 @@ package go_ora
 
 import (
 	"database/sql/driver"
-	"github.com/sijms/go-ora/v2/network"
+
+	"github.com/sijms/go-ora/v2/configurations"
 )
 
 type RefCursor struct {
@@ -18,7 +19,6 @@ func (cursor *RefCursor) load() error {
 	cursor._hasLONG = false
 	cursor._hasBLOB = false
 	cursor._hasReturnClause = false
-	cursor.disableCompression = false
 	cursor.arrayBindCount = 1
 	cursor.scnForSnapshot = make([]int, 2)
 	cursor.stmtType = SELECT
@@ -47,10 +47,11 @@ func (cursor *RefCursor) load() error {
 			if err != nil {
 				return err
 			}
-			if cursor.columns[x].DataType == OCIClobLocator || cursor.columns[x].DataType == OCIBlobLocator {
+			if cursor.columns[x].DataType == OCIClobLocator || cursor.columns[x].DataType == OCIBlobLocator ||
+				cursor.columns[x].DataType == OCIFileLocator {
 				cursor._hasBLOB = true
 			}
-			if cursor.columns[x].DataType == LONG || cursor.columns[x].DataType == LongRaw {
+			if cursor.columns[x].isLongType() {
 				cursor._hasLONG = true
 			}
 		}
@@ -91,13 +92,15 @@ func (cursor *RefCursor) load() error {
 	}
 	return nil
 }
+
 func (cursor *RefCursor) getExeOptions() int {
-	if cursor.connection.connOption.Lob == 0 {
+	if cursor.connection.connOption.Lob == configurations.INLINE {
 		return 0x8050
 	} else {
 		return 0x8040
 	}
 }
+
 func (cursor *RefCursor) _query() (*DataSet, error) {
 	session := cursor.connection.session
 	session.ResetBuffer()
@@ -110,24 +113,18 @@ func (cursor *RefCursor) _query() (*DataSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	// read lobs
-	//if cursor.connection.connOption.Lob != 0 {
-	//	err = cursor.readLobs(dataSet)
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//}
 	err = cursor.decodePrim(dataSet)
 	if err != nil {
 		return nil, err
 	}
 	return dataSet, nil
 }
+
 func (cursor *RefCursor) Query() (*DataSet, error) {
 	if cursor.connection.State != Opened {
-		return nil, &network.OracleError{ErrCode: 6413, ErrMsg: "ORA-06413: Connection not open"}
+		return nil, driver.ErrBadConn
 	}
-	tracer := cursor.connection.connOption.Tracer
+	tracer := cursor.connection.tracer
 	tracer.Printf("Query RefCursor: %d", cursor.cursorID)
 	cursor._noOfRowsToFetch = cursor.connection.connOption.PrefetchRows
 	cursor._hasMoreRows = true
@@ -135,49 +132,21 @@ func (cursor *RefCursor) Query() (*DataSet, error) {
 		copy(cursor.scnForSnapshot, cursor.parent.scnForSnapshot)
 	}
 
-	failOver := cursor.connection.connOption.Failover
-	if failOver == 0 {
-		failOver = 1
-	}
 	dataSet, err := cursor._query()
 	if err != nil {
 		if isBadConn(err) {
+			cursor.connection.setBad()
 			tracer.Print("Error: ", err)
 			return nil, driver.ErrBadConn
 		}
 		return nil, err
 	}
 	return dataSet, nil
-	//var dataSet *DataSet
-	//var err error
-	//var reconnect bool
-	//for writeTrials := 0; writeTrials < failOver; writeTrials++ {
-	//	reconnect, err = cursor.connection.reConnect(nil, writeTrials+1)
-	//	if err != nil {
-	//		tracer.Print("Error: ", err)
-	//		if !reconnect {
-	//			return nil, err
-	//		}
-	//		continue
-	//	}
-	//	// call query
-	//	dataSet, err = cursor._query()
-	//	if err == nil {
-	//		break
-	//	}
-	//	reconnect, err = cursor.connection.reConnect(err, writeTrials+1)
-	//	if err != nil {
-	//		tracer.Print("Error: ", err)
-	//		if !reconnect {
-	//			return nil, err
-	//		}
-	//	}
-	//}
-	//return dataSet, nil
 }
+
 func (cursor *RefCursor) write() error {
-	var define = false
-	if cursor.connection.connOption.Lob == 0 {
+	define := false
+	if cursor.connection.connOption.Lob == configurations.INLINE {
 		define = true
 	}
 	err := cursor.basicWrite(cursor.getExeOptions(), false, define)

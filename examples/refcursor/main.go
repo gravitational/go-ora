@@ -1,13 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
-
-	go_ora "github.com/sijms/go-ora/v2"
 	"os"
 	"time"
+
+	go_ora "github.com/sijms/go-ora/v2"
 )
 
 func createTable(conn *sql.DB) error {
@@ -103,9 +104,10 @@ func usage() {
 	fmt.Println()
 }
 
-func queryCursor(cursor *go_ora.RefCursor) error {
+func queryCursor(conn *sql.DB, cursor *go_ora.RefCursor) error {
 	t := time.Now()
-	rows, err := cursor.Query()
+	rows, err := go_ora.WrapRefCursor(context.Background(), conn, cursor)
+	// rows, err := cursor.Query()
 	if err != nil {
 		return err
 	}
@@ -115,22 +117,27 @@ func queryCursor(cursor *go_ora.RefCursor) error {
 		val  float64
 		date time.Time
 	)
-
-	for rows.Next_() {
+	defer rows.Close()
+	for rows.Next() {
 		err = rows.Scan(&id, &name, &val, &date)
 		if err != nil {
 			return err
 		}
 		fmt.Println("ID: ", id, "\tName: ", name, "\tval: ", val, "\tDate: ", date)
 	}
+	//for rows.Next_() {
+	//	err = rows.Scan(&id, &name, &val, &date)
+	//	if err != nil {
+	//		return err
+	//	}
+	//	fmt.Println("ID: ", id, "\tName: ", name, "\tval: ", val, "\tDate: ", date)
+	//}
 	fmt.Println("Finish query RefCursor: ", time.Now().Sub(t))
 	return nil
 }
 
 func main() {
-	var (
-		server string
-	)
+	var server string
 
 	flag.StringVar(&server, "server", "", "Server's URL, oracle://user:pass@server/service_name")
 	flag.Parse()
@@ -201,7 +208,7 @@ func main() {
 		}
 	}()
 
-	err = queryCursor(&cursor)
+	err = queryCursor(conn, &cursor)
 	if err != nil {
 		fmt.Println("Can't query RefCursor", err)
 	}

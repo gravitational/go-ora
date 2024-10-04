@@ -14,11 +14,11 @@ Typ=100 Len=4: 60,249,140,204
 func TestBinaryFloat(t *testing.T) {
 	cases := []struct {
 		raw      []byte
-		expected float32
+		expected float64
 	}{
 		{
 			[]byte{195, 6, 115, 51},
-			134.45,
+			134.44,
 		},
 		{
 			[]byte{60, 249, 140, 204},

@@ -6,18 +6,23 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"github.com/sijms/go-ora/v2/converters"
-	"github.com/sijms/go-ora/v2/network"
 	"io"
+	"net"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/sijms/go-ora/v2/lazy_init"
+
+	"github.com/sijms/go-ora/v2/converters"
+	"github.com/sijms/go-ora/v2/network"
 )
 
 var (
+	tyBool            = reflect.TypeOf((*bool)(nil)).Elem()
 	tyBytes           = reflect.TypeOf((*[]byte)(nil)).Elem()
 	tyString          = reflect.TypeOf((*string)(nil)).Elem()
 	tyNVarChar        = reflect.TypeOf((*NVarChar)(nil)).Elem()
@@ -40,9 +45,12 @@ var (
 	tyNullTimeStamp   = reflect.TypeOf((*NullTimeStamp)(nil)).Elem()
 	tyNullTimeStampTZ = reflect.TypeOf((*NullTimeStampTZ)(nil)).Elem()
 	tyRefCursor       = reflect.TypeOf((*RefCursor)(nil)).Elem()
+	tyPLBool          = reflect.TypeOf((*PLBool)(nil)).Elem()
+	tyObject          = reflect.TypeOf((*Object)(nil)).Elem()
+	tyNumber          = reflect.TypeOf((*Number)(nil)).Elem()
 )
 
-func parseSqlText(text string) ([]string, error) {
+func refineSqlText(text string) string {
 	index := 0
 	length := len(text)
 	skip := false
@@ -53,7 +61,6 @@ func parseSqlText(text string) ([]string, error) {
 		switch ch {
 		case '\\':
 			// bypass next character
-			index++
 			continue
 		case '/':
 			if index+1 < length && text[index+1] == '*' {
@@ -70,13 +77,20 @@ func parseSqlText(text string) ([]string, error) {
 		case '"':
 			skip = !skip
 		case '-':
-			if index+1 < length && text[index+1] == '-' {
-				index += 1
-				lineComment = true
+			if !skip {
+				if index+1 < length && text[index+1] == '-' {
+					index += 1
+					lineComment = true
+				}
 			}
 		case '\n':
+			//if lineComment {
+			//	lineComment = false
+			//}
 			if lineComment {
 				lineComment = false
+			} else {
+				textBuffer = append(textBuffer, ch) // oheurtel : keep the line feed character
 			}
 		default:
 			if skip || lineComment {
@@ -85,13 +99,24 @@ func parseSqlText(text string) ([]string, error) {
 			textBuffer = append(textBuffer, text[index])
 		}
 	}
-	refinedSql := strings.TrimSpace(string(textBuffer))
-	reg, err := regexp.Compile(`:(\w+)`)
+	return strings.TrimSpace(string(textBuffer))
+}
+
+var parameterNameRegexp = lazy_init.NewLazyInit(func() (interface{}, error) {
+	return regexp.Compile(`:(\w+)`)
+})
+
+func parseQueryParametersNames(text string) (names []string, err error) {
+	refinedSql := refineSqlText(text)
+
+	var parameterNameRegexpAny interface{}
+	parameterNameRegexpAny, err = parameterNameRegexp.GetValue()
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, 10)
-	matches := reg.FindAllStringSubmatch(refinedSql, -1)
+
+	names = make([]string, 0, 10)
+	matches := parameterNameRegexpAny.(*regexp.Regexp).FindAllStringSubmatch(refinedSql, -1)
 	for _, match := range matches {
 		if len(match) > 1 {
 			names = append(names, match[1])
@@ -169,6 +194,7 @@ func tSigned(input reflect.Type) bool {
 		return false
 	}
 }
+
 func tUnsigned(input reflect.Type) bool {
 	switch input.Kind() {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
@@ -177,15 +203,19 @@ func tUnsigned(input reflect.Type) bool {
 		return false
 	}
 }
+
 func tInteger(input reflect.Type) bool {
 	return tSigned(input) || tUnsigned(input)
 }
+
 func tFloat(input reflect.Type) bool {
 	return input.Kind() == reflect.Float32 || input.Kind() == reflect.Float64
 }
+
 func tNumber(input reflect.Type) bool {
-	return tInteger(input) || tFloat(input) || input.Kind() == reflect.Bool
+	return tInteger(input) || tFloat(input) || input == tyBool
 }
+
 func tNullNumber(input reflect.Type) bool {
 	switch input {
 	case tyNullBool, tyNullByte, tyNullInt16, tyNullInt32, tyNullInt64:
@@ -233,85 +263,60 @@ func getString(col interface{}) string {
 	}
 }
 
-func getNumber(col interface{}) (interface{}, error) {
-	var err error
-	col, err = getValue(col)
+func getBool(col interface{}) (bool, error) {
+	col, err := getValue(col)
 	if err != nil {
-		return int64(0), err
+		return false, err
 	}
 	if col == nil {
-		return int64(0), nil
+		return false, nil
 	}
-	rType := reflect.TypeOf(col)
 	rValue := reflect.ValueOf(col)
-	if tSigned(rType) {
-		return rValue.Int(), nil
-	}
-	if tUnsigned(rType) {
-		return rValue.Uint(), nil
-	}
-	if f32, ok := col.(float32); ok {
-		return strconv.ParseFloat(fmt.Sprint(f32), 64)
-	}
-	if tFloat(rType) {
-		return rValue.Float(), nil
-	}
-	switch rType.Kind() {
-	case reflect.Bool:
-		if rValue.Bool() {
-			return int64(1), nil
-		} else {
-			return int64(0), nil
-		}
-	case reflect.String:
-		tempFloat, err := strconv.ParseFloat(rValue.String(), 64)
-		if err != nil {
-			return 0, err
-		}
-		return tempFloat, nil
-	default:
-		return 0, errors.New("conversion of unsupported type to number")
-	}
+	return rValue.Bool(), nil
 }
 
+//func getNumber(col interface{}) (*Number, error) {
+//
+//}
+
 // get prim float64 from supported types
-func getFloat(col interface{}) (float64, error) {
-	var err error
-	col, err = getValue(col)
-	if err != nil {
-		return 0, err
-	}
-	if col == nil {
-		return 0, nil
-	}
-	rType := reflect.TypeOf(col)
-	rValue := reflect.ValueOf(col)
-	if tInteger(rType) {
-		return float64(rValue.Int()), nil
-	}
-	if f32, ok := col.(float32); ok {
-		return strconv.ParseFloat(fmt.Sprint(f32), 64)
-	}
-	if tFloat(rType) {
-		return rValue.Float(), nil
-	}
-	switch rType.Kind() {
-	case reflect.Bool:
-		if rValue.Bool() {
-			return 1, nil
-		} else {
-			return 0, nil
-		}
-	case reflect.String:
-		tempFloat, err := strconv.ParseFloat(rValue.String(), 64)
-		if err != nil {
-			return 0, err
-		}
-		return tempFloat, nil
-	default:
-		return 0, errors.New("conversion of unsupported type to float")
-	}
-}
+//func getFloat(col interface{}) (float64, error) {
+//	var err error
+//	col, err = getValue(col)
+//	if err != nil {
+//		return 0, err
+//	}
+//	if col == nil {
+//		return 0, nil
+//	}
+//	rType := reflect.TypeOf(col)
+//	rValue := reflect.ValueOf(col)
+//	if tInteger(rType) {
+//		return float64(rValue.Int()), nil
+//	}
+//	if f32, ok := col.(float32); ok {
+//		return strconv.ParseFloat(fmt.Sprint(f32), 64)
+//	}
+//	if tFloat(rType) {
+//		return rValue.Float(), nil
+//	}
+//	switch rType.Kind() {
+//	case reflect.Bool:
+//		if rValue.Bool() {
+//			return 1, nil
+//		} else {
+//			return 0, nil
+//		}
+//	case reflect.String:
+//		tempFloat, err := strconv.ParseFloat(rValue.String(), 64)
+//		if err != nil {
+//			return 0, err
+//		}
+//		return tempFloat, nil
+//	default:
+//		return 0, errors.New("conversion of unsupported type to float")
+//	}
+//}
 
 // get prim int64 value from supported types
 func getInt(col interface{}) (int64, error) {
@@ -413,15 +418,21 @@ func getLob(col interface{}, conn *Connection) (*Lob, error) {
 	case string:
 		stringVar = val
 	case Clob:
+		if !val.Valid {
+			return nil, nil
+		}
 		stringVar = val.String
 	case NVarChar:
 		stringVar = string(val)
 		charsetForm = 2
 		charsetID = conn.tcpNego.ServernCharset
 	case NClob:
-		stringVar = val.String
 		charsetForm = 2
 		charsetID = conn.tcpNego.ServernCharset
+		if !val.Valid {
+			return nil, nil
+		}
+		stringVar = val.String
 	case []byte:
 		byteVar = val
 	case Blob:
@@ -457,18 +468,15 @@ func setBytes(value reflect.Value, input []byte) error {
 		}
 		return setBytes(value.Elem(), input)
 	}
-	switch value.Kind() {
-	case reflect.String:
-		value.SetString(string(input))
-		return nil
-	}
 	switch value.Type() {
+	case tyString:
+		value.SetString(string(input))
 	case tyBytes:
 		value.SetBytes(input)
 	case tyNVarChar:
 		value.Set(reflect.ValueOf(NVarChar(input)))
 	case tyBlob:
-		value.Set(reflect.ValueOf(Blob{Data: input, Valid: true}))
+		value.Set(reflect.ValueOf(Blob{Data: input}))
 	case tyClob:
 		value.Set(reflect.ValueOf(Clob{String: string(input), Valid: true}))
 	case tyNClob:
@@ -478,10 +486,22 @@ func setBytes(value reflect.Value, input []byte) error {
 	case tyNullNVarChar:
 		value.Set(reflect.ValueOf(NullNVarChar{NVarChar(input), true}))
 	default:
+		if temp, ok := value.Interface().(sql.Scanner); ok {
+			if temp != nil && !reflect.ValueOf(temp).IsNil() {
+				return temp.Scan(input)
+			}
+		}
+		if value.CanAddr() {
+			if temp, ok := value.Addr().Interface().(sql.Scanner); ok {
+				err := temp.Scan(input)
+				return err
+			}
+		}
 		return fmt.Errorf("can not assign []byte to type: %v", value.Type().Name())
 	}
 	return nil
 }
+
 func setTime(value reflect.Value, input time.Time) error {
 	if value.Kind() == reflect.Ptr {
 		if value.IsNil() {
@@ -489,12 +509,9 @@ func setTime(value reflect.Value, input time.Time) error {
 		}
 		return setTime(value.Elem(), input)
 	}
-	switch value.Kind() {
-	case reflect.String:
-		value.SetString(input.Format(time.RFC3339))
-		return nil
-	}
 	switch value.Type() {
+	case tyString:
+		value.SetString(input.Format(time.RFC3339))
 	case tyTime:
 		value.Set(reflect.ValueOf(input))
 	case tyTimeStamp:
@@ -510,21 +527,54 @@ func setTime(value reflect.Value, input time.Time) error {
 	case tyNullTimeStampTZ:
 		value.Set(reflect.ValueOf(NullTimeStampTZ{TimeStampTZ(input), true}))
 	default:
+		if temp, ok := value.Interface().(sql.Scanner); ok {
+			if temp != nil && !reflect.ValueOf(temp).IsNil() {
+				return temp.Scan(input)
+			}
+		}
+		if value.CanAddr() {
+			if temp, ok := value.Addr().Interface().(sql.Scanner); ok {
+				err := temp.Scan(input)
+				return err
+			}
+		}
 		return fmt.Errorf("can not assign time to type: %v", value.Type().Name())
 	}
 	return nil
 }
-func setFieldValue(fieldValue reflect.Value, cust *customType, input interface{}) error {
 
-	//input should be one of primitive values
+func setFieldValue(fieldValue reflect.Value, cust *customType, input interface{}) error {
+	// input should be one of primitive values
 	if input == nil {
 		return setNull(fieldValue)
 	}
+	if fieldValue.Kind() == reflect.Ptr && fieldValue.Elem().Kind() == reflect.Interface {
+		fieldValue.Elem().Set(reflect.ValueOf(input))
+		return nil
+	}
+	if fieldValue.Kind() == reflect.Interface {
+		fieldValue.Set(reflect.ValueOf(input))
+		return nil
+	}
+	//if fieldValue.CanAddr() {
+	//	if scan, ok := fieldValue.Addr().Interface().(sql.Scanner); ok {
+	//		return scan.Scan(input)
+	//	}
+	//} else {
+	//	if scan, ok := fieldValue.Interface().(sql.Scanner); ok {
+	//		return scan.Scan(input)
+	//	}
+	//}
+
 	switch val := input.(type) {
-	case int64:
-		return setNumber(fieldValue, float64(val))
-	case float64:
-		return setNumber(fieldValue, val)
+	case int64, float64:
+		num, err := NewNumber(val)
+		if err != nil {
+			return err
+		}
+		return setNumber(fieldValue, num)
+	// case float64:
+	//	return setNumber(fieldValue, val)
 	case string:
 		return setString(fieldValue, val)
 	case time.Time:
@@ -552,14 +602,16 @@ func setFieldValue(fieldValue reflect.Value, cust *customType, input interface{}
 		return fmt.Errorf("unsupported primitive type: %s", fieldValue.Type().Name())
 	}
 }
+
 func setNull(value reflect.Value) error {
 	if value.Kind() == reflect.Ptr && value.IsNil() {
 		return nil
 	}
 	value.Set(reflect.Zero(value.Type()))
-	//value.SetZero()
+	// value.SetZero()
 	return nil
 }
+
 func setBFile(value reflect.Value, input BFile) error {
 	if value.Kind() == reflect.Ptr {
 		if value.IsNil() {
@@ -571,10 +623,22 @@ func setBFile(value reflect.Value, input BFile) error {
 	case tyBFile:
 		value.Set(reflect.ValueOf(input))
 	default:
+		if temp, ok := value.Interface().(sql.Scanner); ok {
+			if temp != nil && !reflect.ValueOf(temp).IsNil() {
+				return temp.Scan(input)
+			}
+		}
+		if value.CanAddr() {
+			if temp, ok := value.Addr().Interface().(sql.Scanner); ok {
+				err := temp.Scan(input)
+				return err
+			}
+		}
 		return fmt.Errorf("can't assign BFILE to type: %v", value.Type().Name())
 	}
 	return nil
 }
+
 func setArray(value reflect.Value, input []ParameterInfo) error {
 	if value.Kind() == reflect.Ptr {
 		if value.IsNil() {
@@ -604,22 +668,26 @@ func setUDTObject(value reflect.Value, cust *customType, input []ParameterInfo) 
 		return setUDTObject(value.Elem(), cust, input)
 	}
 	if value.Kind() == reflect.Slice || value.Kind() == reflect.Array {
-		arrayObj := reflect.MakeSlice(reflect.SliceOf(cust.typ), 0, len(input))
-		for _, par := range input {
-			if temp, ok := par.oPrimValue.([]ParameterInfo); ok {
-				tempObj2 := reflect.New(cust.typ)
-				err := setFieldValue(tempObj2.Elem(), par.cusType, temp)
-				if err != nil {
-					return err
-				}
-				arrayObj = reflect.Append(arrayObj, tempObj2.Elem())
-			}
-		}
-		value.Set(arrayObj)
+		return setArray(value, input)
+		//if cust.isRegularArray() {
+		//
+		//} else {
+		//	arrayObj := reflect.MakeSlice(reflect.SliceOf(cust.typ), 0, len(input))
+		//	for _, par := range input {
+		//		if temp, ok := par.oPrimValue.([]ParameterInfo); ok {
+		//			tempObj2 := reflect.New(cust.typ)
+		//			err := setFieldValue(tempObj2.Elem(), par.cusType, temp)
+		//			if err != nil {
+		//				return err
+		//			}
+		//			arrayObj = reflect.Append(arrayObj, tempObj2.Elem())
+		//		}
+		//	}
+		//	value.Set(arrayObj)
+		//}
 	} else {
 		tempObj := reflect.New(cust.typ)
 		for _, par := range input {
-
 			if fieldIndex, ok := cust.fieldMap[par.Name]; ok {
 				err := setFieldValue(tempObj.Elem().Field(fieldIndex), par.cusType, par.oPrimValue)
 				if err != nil {
@@ -671,16 +739,13 @@ func setLob(value reflect.Value, input Lob) error {
 		return ret, nil
 	}
 	var strConv converters.IStringConverter
-	switch value.Kind() {
-	case reflect.String:
+	switch value.Type() {
+	case tyString:
 		strConv, err = getStrConv()
 		if err != nil {
 			return err
 		}
 		value.SetString(strConv.Decode(lobData))
-		return nil
-	}
-	switch value.Type() {
 	case tyNullString:
 		strConv, err = getStrConv()
 		if err != nil {
@@ -707,7 +772,8 @@ func setLob(value reflect.Value, input Lob) error {
 		value.Set(reflect.ValueOf(Clob{
 			String:  strConv.Decode(lobData),
 			Valid:   true,
-			locator: input.sourceLocator}))
+			locator: input.sourceLocator,
+		}))
 	case tyNClob:
 		strConv, err = getStrConv()
 		if err != nil {
@@ -716,15 +782,27 @@ func setLob(value reflect.Value, input Lob) error {
 		value.Set(reflect.ValueOf(NClob{
 			String:  strConv.Decode(lobData),
 			Valid:   true,
-			locator: input.sourceLocator}))
+			locator: input.sourceLocator,
+		}))
 	case tyBlob:
 		value.Set(reflect.ValueOf(Blob{
 			Data:    lobData,
-			Valid:   true,
-			locator: input.sourceLocator}))
+			locator: input.sourceLocator,
+		}))
 	case tyBytes:
 		value.Set(reflect.ValueOf(lobData))
 	default:
+		if temp, ok := value.Interface().(sql.Scanner); ok {
+			if temp != nil && !reflect.ValueOf(temp).IsNil() {
+				return temp.Scan(lobData)
+			}
+		}
+		if value.CanAddr() {
+			if temp, ok := value.Addr().Interface().(sql.Scanner); ok {
+				err := temp.Scan(lobData)
+				return err
+			}
+		}
 		return fmt.Errorf("can't assign LOB to type: %v", value.Type().Name())
 	}
 	return nil
@@ -768,19 +846,21 @@ func setString(value reflect.Value, input string) error {
 		}
 		return floatErr
 	}
-	switch value.Kind() {
-	case reflect.String:
-		value.SetString(input)
-		return nil
-	case reflect.Bool:
+	switch value.Type() {
+	case tyNumber:
+		tempNum, err := NewNumberFromString(input)
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(*tempNum))
+	case tyBool:
 		if strings.ToLower(input) == "true" {
 			value.SetBool(true)
 		} else {
 			value.SetBool(false)
 		}
-		return nil
-	}
-	switch value.Type() {
+	case tyString:
+		value.SetString(input)
 	case tyNullString:
 		value.Set(reflect.ValueOf(sql.NullString{input, true}))
 	case tyNullByte:
@@ -805,7 +885,7 @@ func setString(value reflect.Value, input string) error {
 		return intErr
 	case tyNullFloat64:
 		if floatErr == nil {
-			value.Set(reflect.ValueOf(sql.NullFloat64{float64(tempInt), true}))
+			value.Set(reflect.ValueOf(sql.NullFloat64{tempFloat, true}))
 		}
 		return floatErr
 	case tyNullBool:
@@ -850,6 +930,17 @@ func setString(value reflect.Value, input string) error {
 	case tyNClob:
 		value.Set(reflect.ValueOf(NClob{String: input, Valid: true}))
 	default:
+		if temp, ok := value.Interface().(sql.Scanner); ok {
+			if temp != nil && !reflect.ValueOf(temp).IsNil() {
+				return temp.Scan(input)
+			}
+		}
+		if value.CanAddr() {
+			if temp, ok := value.Addr().Interface().(sql.Scanner); ok {
+				err := temp.Scan(input)
+				return err
+			}
+		}
 		return fmt.Errorf("can not assign string to type: %v", value.Type().Name())
 	}
 	return nil
@@ -874,7 +965,7 @@ func setString(value reflect.Value, input string) error {
 //		}
 //	}
 
-func setNumber(value reflect.Value, input float64) error {
+func setNumber(value reflect.Value, input *Number) error {
 	if value.Kind() == reflect.Ptr {
 		if value.IsNil() {
 			value.Set(reflect.New(value.Type().Elem()))
@@ -882,76 +973,126 @@ func setNumber(value reflect.Value, input float64) error {
 		return setNumber(value.Elem(), input)
 	}
 	if tSigned(value.Type()) {
-		value.SetInt(int64(input))
+		temp, err := input.Int64()
+		if err != nil {
+			return err
+		}
+		value.SetInt(temp)
 		return nil
 	}
 	if tUnsigned(value.Type()) {
-		value.SetUint(uint64(input))
+		temp, err := input.Uint64()
+		if err != nil {
+			return err
+		}
+		value.SetUint(temp)
 		return nil
 	}
 	if tFloat(value.Type()) {
-		value.SetFloat(input)
-		return nil
-	}
-	switch value.Kind() {
-	case reflect.Bool:
-		value.SetBool(input != 0)
-		return nil
-	case reflect.String:
-		value.SetString(fmt.Sprintf("%v", input))
+		temp, err := input.Float64()
+		if err != nil {
+			return err
+		}
+		value.SetFloat(temp)
 		return nil
 	}
 	switch value.Type() {
+	case tyBool:
+		value.SetBool(!input.isZero())
+	case tyString:
+		temp, err := input.String()
+		if err != nil {
+			return err
+		}
+		value.SetString(temp)
 	case tyNullString:
-		value.Set(reflect.ValueOf(sql.NullString{fmt.Sprintf("%v", input), true}))
+		temp, err := input.String()
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(sql.NullString{temp, true}))
 	case tyNullByte:
-		value.Set(reflect.ValueOf(sql.NullByte{uint8(input), true}))
+		temp, err := input.Int64()
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(sql.NullByte{uint8(temp), true}))
 	case tyNullInt16:
-		value.Set(reflect.ValueOf(sql.NullInt16{int16(input), true}))
+		temp, err := input.Int64()
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(sql.NullInt16{int16(temp), true}))
 	case tyNullInt32:
-		value.Set(reflect.ValueOf(sql.NullInt32{int32(input), true}))
+		temp, err := input.Int64()
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(sql.NullInt32{int32(temp), true}))
 	case tyNullInt64:
-		value.Set(reflect.ValueOf(sql.NullInt64{int64(input), true}))
+		temp, err := input.Int64()
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(sql.NullInt64{temp, true}))
 	case tyNullFloat64:
-		value.Set(reflect.ValueOf(sql.NullFloat64{input, true}))
+		temp, err := input.Float64()
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(sql.NullFloat64{temp, true}))
 	case tyNullBool:
-		value.Set(reflect.ValueOf(sql.NullBool{input != 0, true}))
+		value.Set(reflect.ValueOf(sql.NullBool{!input.isZero(), true}))
 	case tyNullNVarChar:
-		value.Set(reflect.ValueOf(NullNVarChar{NVarChar(fmt.Sprintf("%v", input)), true}))
+		temp, err := input.String()
+		if err != nil {
+			return err
+		}
+		value.Set(reflect.ValueOf(NullNVarChar{NVarChar(temp), true}))
 	default:
+		if temp, ok := value.Interface().(sql.Scanner); ok {
+			if temp != nil && !reflect.ValueOf(temp).IsNil() {
+				return temp.Scan(input)
+			}
+		}
+		if value.CanAddr() {
+			if temp, ok := value.Addr().Interface().(sql.Scanner); ok {
+				err := temp.Scan(input)
+				return err
+			}
+		}
 		return fmt.Errorf("can not assign number to type: %v", value.Type().Name())
 	}
 	return nil
 }
 
 func isBadConn(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, syscall.EPIPE)
-}
-
-func collectLocators(pars []ParameterInfo) [][]byte {
-	output := make([][]byte, 0, 10)
-	for _, par := range pars {
-		switch value := par.iPrimValue.(type) {
-		case *Lob:
-			if value != nil && value.sourceLocator != nil {
-				output = append(output, value.sourceLocator)
-			}
-		case *BFile:
-			if value != nil && value.lob.sourceLocator != nil {
-				output = append(output, value.lob.sourceLocator)
-			}
-		case []ParameterInfo:
-			temp := collectLocators(value)
-			output = append(output, temp...)
+	var opError *net.OpError
+	var oraError *network.OracleError
+	switch {
+	case errors.Is(err, io.EOF):
+		return true
+	case errors.Is(err, syscall.EPIPE):
+		return true
+	case errors.As(err, &opError):
+		if opError.Net == "tcp" && opError.Op == "write" {
+			return true
 		}
+	case errors.As(err, &oraError):
+		return oraError.Bad()
 	}
-	return output
+	return false
 }
 
-//func initializePtr(v interface{}) {
-//	rv := reflect.ValueOf(v).Elem()
-//	rv.Set(reflect.New(rv.Type().Elem()))
-//}
+func getTOID2(conn *sql.DB, owner, typeName string) ([]byte, error) {
+	var toid []byte
+	err := conn.QueryRow(`SELECT type_oid FROM ALL_TYPES WHERE UPPER(OWNER)=:1 AND UPPER(TYPE_NAME)=:2`,
+		strings.ToUpper(owner), strings.ToUpper(typeName)).Scan(&toid)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = fmt.Errorf("type: %s is not present or wrong type name", typeName)
+	}
+	return toid, err
+}
 
 func getTOID(conn *Connection, owner, typeName string) ([]byte, error) {
 	sqlText := `SELECT type_oid FROM ALL_TYPES WHERE UPPER(OWNER)=:1 AND UPPER(TYPE_NAME)=:2`
@@ -960,8 +1101,10 @@ func getTOID(conn *Connection, owner, typeName string) ([]byte, error) {
 		_ = stmt.Close()
 	}(stmt)
 	var ret []byte
-	rows, err := stmt.Query_([]driver.NamedValue{driver.NamedValue{Value: strings.ToUpper(owner)},
-		driver.NamedValue{Value: strings.ToUpper(typeName)}})
+	rows, err := stmt.Query_([]driver.NamedValue{
+		{Value: strings.ToUpper(owner)},
+		{Value: strings.ToUpper(typeName)},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -997,63 +1140,341 @@ func encodeObject(session *network.Session, objectData []byte, isArray bool) []b
 	return fieldsData.Bytes()
 }
 
-func decodeObject(conn *Connection, parent *ParameterInfo) error {
-	session := conn.session
-	newState := network.SessionState{InBuffer: parent.BValue}
-	session.SaveState(&newState)
-	objectType, err := session.GetByte()
-	if err != nil {
-		return err
-	}
-	ctl, err := session.GetInt(4, true, true)
-	if err != nil {
-		return err
-	}
-	if ctl == 0xFE {
-		_, err = session.GetInt(4, false, true)
-		if err != nil {
-			return err
+func putUDTAttributes(input *customType, pars []ParameterInfo, index int) ([]ParameterInfo, int) {
+	oPrimValue := make([]ParameterInfo, 0, len(input.attribs))
+	for _, attrib := range input.attribs {
+		if attrib.cusType != nil && !attrib.cusType.isArray {
+			var tempValue []ParameterInfo
+			tempValue, index = putUDTAttributes(attrib.cusType, pars, index)
+			attrib.oPrimValue = tempValue
+			oPrimValue = append(oPrimValue, attrib)
+		} else {
+			oPrimValue = append(oPrimValue, pars[index])
+			index++
 		}
 	}
-	switch objectType {
-	case 0x88:
-		_ /*attribsLen*/, err := session.GetInt(2, true, true)
-		if err != nil {
-			return err
-		}
+	return oPrimValue, index
+}
 
-		itemsLen, err := session.GetInt(2, false, true)
+func getUDTAttributes(input *customType, value reflect.Value) []ParameterInfo {
+	output := make([]ParameterInfo, 0, 10)
+	for _, attrib := range input.attribs {
+		fieldValue := reflect.Value{}
+		if value.IsValid() && value.Kind() == reflect.Struct {
+			if fieldIndex, ok := input.fieldMap[attrib.Name]; ok {
+				fieldValue = value.Field(fieldIndex)
+			}
+		}
+		// if attribute is a nested type and not array
+		if attrib.cusType != nil && !attrib.cusType.isArray {
+			output = append(output, getUDTAttributes(attrib.cusType, fieldValue)...)
+		} else {
+			if isArrayValue(fieldValue) {
+				attrib.MaxNoOfArrayElements = 1
+			}
+			if fieldValue.IsValid() {
+				attrib.Value = fieldValue.Interface()
+			}
+
+			output = append(output, attrib)
+		}
+	}
+	return output
+}
+
+func isArrayValue(val interface{}) bool {
+	tyVal := reflect.TypeOf(val)
+	if tyVal == nil {
+		return false
+	}
+	for tyVal.Kind() == reflect.Ptr {
+		tyVal = tyVal.Elem()
+	}
+	if tyVal != tyBytes && (tyVal.Kind() == reflect.Array || tyVal.Kind() == reflect.Slice) {
+		return true
+	}
+	return false
+}
+
+func decodeObject(conn *Connection, parent *ParameterInfo, temporaryLobs *[][]byte) error {
+	session := conn.session
+	if parent.parent == nil {
+		newState := network.SessionState{InBuffer: parent.BValue}
+		session.SaveState(&newState)
+		defer session.LoadState()
+		objectType, err := session.GetByte()
 		if err != nil {
 			return err
 		}
-		pars := make([]ParameterInfo, 0, itemsLen)
-		for x := 0; x < itemsLen; x++ {
-			tempPar := parent.clone()
-			tempPar.Direction = parent.Direction
-			tempPar.BValue, err = session.GetClr()
-			if err != nil {
-				return err
-			}
-			err = decodeObject(conn, &tempPar)
-			if err != nil {
-				return err
-			}
-			pars = append(pars, tempPar)
+		ctl, err := session.GetInt(4, true, true)
+		if err != nil {
+			return err
 		}
-		parent.oPrimValue = pars
-	case 0x84:
-		pars := make([]ParameterInfo, 0, len(parent.cusType.attribs))
-		for _, attrib := range parent.cusType.attribs {
-			tempPar := attrib
-			tempPar.Direction = parent.Direction
-			err = tempPar.decodePrimValue(conn, true)
+		if ctl == 0xFE {
+			_, err = session.GetInt(4, false, true)
 			if err != nil {
 				return err
 			}
-			pars = append(pars, tempPar)
+		}
+		switch objectType {
+		case 0x88:
+			_ /*attribsLen*/, err := session.GetInt(2, true, true)
+			if err != nil {
+				return err
+			}
+
+			itemsLen, err := session.GetInt(2, false, true)
+			if err != nil {
+				return err
+			}
+			if itemsLen == 0xFE {
+				itemsLen, err = session.GetInt(4, false, true)
+				if err != nil {
+					return err
+				}
+			}
+			pars := make([]ParameterInfo, 0, itemsLen)
+			for x := 0; x < itemsLen; x++ {
+				tempPar := parent.cusType.attribs[0]
+				//if parent.cusType.isRegularArray() {
+				//
+				//} else {
+				//	tempPar = parent.clone()
+				//}
+
+				tempPar.Direction = parent.Direction
+				if tempPar.DataType == XMLType {
+					ctlByte, err := session.GetByte()
+					if err != nil {
+						return err
+					}
+					var objectBufferSize int
+					if ctlByte == 0xFE {
+						objectBufferSize, err = session.GetInt(4, false, true)
+						if err != nil {
+							return err
+						}
+					} else {
+						objectBufferSize = int(ctlByte)
+					}
+					tempPar.BValue, err = session.GetBytes(objectBufferSize)
+					if err != nil {
+						return err
+					}
+					err = decodeObject(conn, &tempPar, temporaryLobs)
+				} else {
+					err = tempPar.decodePrimValue(conn, temporaryLobs, true)
+				}
+				if err != nil {
+					return err
+				}
+				pars = append(pars, tempPar)
+			}
+			parent.oPrimValue = pars
+		case 0x84:
+			// pars := make([]ParameterInfo, 0, len(parent.cusType.attribs))
+			// collect all attributes in one list
+			// pars := getUDTAttributes(parent.cusType, reflect.Value{})
+			pars := make([]ParameterInfo, 0, 10)
+			for _, attrib := range parent.cusType.attribs {
+				attrib.Direction = parent.Direction
+				attrib.parent = parent
+				// check if this an object or array and comming value is nil
+				if attrib.DataType == XMLType {
+					temp, err := session.Peek(1)
+					if err != nil {
+						return err
+					}
+					if temp[0] == 0xFD || temp[0] == 0xFF {
+						_, err = session.GetByte()
+						if err != nil {
+							return err
+						}
+					} else {
+						if attrib.cusType.isArray {
+							attrib.parent = nil
+							attrib.BValue, err = session.GetFixedClr()
+						}
+						err = decodeObject(conn, &attrib, temporaryLobs)
+						if err != nil {
+							return err
+						}
+					}
+				} else {
+					err := attrib.decodePrimValue(conn, temporaryLobs, true)
+					if err != nil {
+						return err
+					}
+				}
+				//err = attrib.decodePrimValue(conn, temporaryLobs, true)
+				//if err != nil {
+				//	return err
+				//}
+				pars = append(pars, attrib)
+			}
+			parent.oPrimValue = pars
+			//for index, _ := range pars {
+			//	pars[index].Direction = parent.Direction
+			//	pars[index].parent = parent
+			//	// if we get 0xFD this means null object
+			//	err = pars[index].decodePrimValue(conn, temporaryLobs, true)
+			//	if err != nil {
+			//		return err
+			//	}
+			//}
+			// fill pars in its place in sub types
+			//parent.oPrimValue, _ = putUDTAttributes(parent.cusType, pars, 0)
+		}
+	} else {
+		pars := make([]ParameterInfo, 0, 10)
+		for _, attrib := range parent.cusType.attribs {
+			attrib.Direction = parent.Direction
+			attrib.parent = parent
+			// check if this an object or array and comming value is nil
+			if attrib.DataType == XMLType {
+				temp, err := session.Peek(1)
+				if err != nil {
+					return err
+				}
+				if temp[0] == 0xFD || temp[0] == 0xFF {
+					_, err = session.GetByte()
+					if err != nil {
+						return err
+					}
+				} else {
+					if attrib.cusType.isArray {
+						attrib.parent = nil
+						nb, err := session.GetByte()
+						if err != nil {
+							return err
+						}
+						var size int
+						switch nb {
+						case 0:
+							size = 0
+						case 0xFE:
+							size, err = session.GetInt(4, false, true)
+							if err != nil {
+								return err
+							}
+						default:
+							size = int(nb)
+						}
+						if size > 0 {
+							attrib.BValue, err = session.GetBytes(size)
+							if err != nil {
+								return err
+							}
+						}
+					}
+					err = decodeObject(conn, &attrib, temporaryLobs)
+					if err != nil {
+						return err
+					}
+				}
+			} else {
+				err := attrib.decodePrimValue(conn, temporaryLobs, true)
+				if err != nil {
+					return err
+				}
+			}
+
+			pars = append(pars, attrib)
 		}
 		parent.oPrimValue = pars
 	}
-	_ = session.LoadState()
+
 	return nil
+}
+
+func parseInputField(structValue reflect.Value, name, _type string, fieldIndex int) (tempPar *ParameterInfo, err error) {
+	tempPar = &ParameterInfo{
+		Name:      name,
+		Direction: Input,
+	}
+	fieldValue := structValue.Field(fieldIndex)
+	for fieldValue.Type().Kind() == reflect.Ptr {
+		if fieldValue.IsNil() {
+			tempPar.Value = nil
+			return
+		}
+		fieldValue = fieldValue.Elem()
+	}
+	if !fieldValue.IsValid() {
+		tempPar.Value = nil
+		return
+	}
+	if fieldValue.CanInterface() && fieldValue.Interface() == nil {
+		tempPar.Value = nil
+		return
+	}
+	typeErr := fmt.Errorf("error passing field %s as type %s", fieldValue.Type().Name(), _type)
+	switch _type {
+	case "number":
+		// var fieldVal float64
+		tempPar.Value, err = NewNumber(fieldValue.Interface()) // getFloat(fieldValue.Interface())
+		if err != nil {
+			err = typeErr
+			return
+		}
+	case "varchar":
+		tempPar.Value = getString(fieldValue.Interface())
+	case "nvarchar":
+		tempPar.Value = NVarChar(getString(fieldValue.Interface()))
+	case "date":
+		tempPar.Value, err = getDate(fieldValue.Interface())
+		if err != nil {
+			err = typeErr
+			return
+		}
+	case "timestamp":
+		var fieldVal time.Time
+		fieldVal, err = getDate(fieldValue.Interface())
+		if err != nil {
+			err = typeErr
+			return
+		}
+		tempPar.Value = TimeStamp(fieldVal)
+	case "timestamptz":
+		var fieldVal time.Time
+		fieldVal, err = getDate(fieldValue.Interface())
+		if err != nil {
+			err = typeErr
+			return
+		}
+		tempPar.Value = TimeStampTZ(fieldVal)
+	case "raw":
+		tempPar.Value, err = getBytes(fieldValue.Interface())
+		if err != nil {
+			err = typeErr
+			return
+		}
+	case "clob":
+		fieldVal := getString(fieldValue.Interface())
+		if len(fieldVal) == 0 {
+			tempPar.Value = Clob{Valid: false}
+		} else {
+			tempPar.Value = Clob{String: fieldVal, Valid: true}
+		}
+	case "nclob":
+		fieldVal := getString(fieldValue.Interface())
+		if len(fieldVal) == 0 {
+			tempPar.Value = NClob{Valid: false}
+		} else {
+			tempPar.Value = NClob{String: fieldVal, Valid: true}
+		}
+	case "blob":
+		var fieldVal []byte
+		fieldVal, err = getBytes(fieldValue.Interface())
+		if err != nil {
+			err = typeErr
+			return
+		}
+		tempPar.Value = Blob{Data: fieldVal}
+	case "":
+		tempPar.Value = fieldValue.Interface()
+	default:
+		err = typeErr
+	}
+	return
 }

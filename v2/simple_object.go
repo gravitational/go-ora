@@ -2,18 +2,21 @@ package go_ora
 
 import (
 	"database/sql/driver"
+	"errors"
+
+	"github.com/sijms/go-ora/v2/network"
 )
 
 type simpleObject struct {
 	connection *Connection
-	//session     *network.Session
+	// session     *network.Session
 	operationID uint8
 	data        []byte
 	err         error
 }
 
 func (obj *simpleObject) write() *simpleObject {
-	//obj.session.ResetBuffer()
+	// obj.session.ResetBuffer()
 	session := obj.connection.session
 	session.PutBytes(3, obj.operationID, 0)
 	if obj.data != nil {
@@ -24,39 +27,44 @@ func (obj *simpleObject) write() *simpleObject {
 }
 
 func (obj *simpleObject) read() error {
-	session := obj.connection.session
 	if obj.err != nil {
 		return obj.err
 	}
-	loop := true
-	for loop {
-		msg, err := session.GetByte()
-		if err != nil {
-			return err
-		}
-		err = obj.connection.readResponse(msg)
-		if err != nil {
-			return err
-		}
-		if msg == 4 || msg == 9 {
-			loop = false
-		}
-	}
-	if session.HasError() {
-		return session.GetError()
-	}
-	return nil
+	return obj.connection.read()
+	//loop := true
+	//for loop {
+	//	msg, err := session.GetByte()
+	//	if err != nil {
+	//		return err
+	//	}
+	//	err = obj.connection.readMsg(msg)
+	//	if err != nil {
+	//		return err
+	//	}
+	//	if msg == 4 || msg == 9 {
+	//		loop = false
+	//	}
+	//}
+	//if session.HasError() {
+	//	return session.GetError()
+	//}
+	//return nil
 }
 
 func (obj *simpleObject) exec() error {
-	tracer := obj.connection.connOption.Tracer
-	failOver := obj.connection.connOption.Failover
-	if failOver == 0 {
-		failOver = 1
+	conn := obj.connection
+	tracer := conn.tracer
+	obj.write()
+	if obj.err != nil {
+		return obj.err
 	}
-	var err = obj.write().read()
+	err := conn.read()
+	if errors.Is(err, network.ErrConnReset) {
+		err = conn.read()
+	}
 	if err != nil {
 		if isBadConn(err) {
+			obj.connection.setBad()
 			tracer.Print("Error: ", err)
 			return driver.ErrBadConn
 		}

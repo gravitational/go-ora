@@ -1,11 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
-	go_ora "github.com/sijms/go-ora/v2"
 	"os"
 	"time"
+
+	go_ora "github.com/sijms/go-ora/v2"
 )
 
 type test1 struct {
@@ -13,18 +15,14 @@ type test1 struct {
 	Name string `udt:"test_name"`
 }
 
-func createUDT(conn *go_ora.Connection) error {
+func createUDT(conn *sql.DB) error {
 	t := time.Now()
 	sqlText := `create or replace TYPE TEST_TYPE1 IS OBJECT 
 (
     TEST_ID NUMBER(10, 0),
     TEST_NAME VARCHAR2(10)
 )`
-	stmt := go_ora.NewStmt(sqlText, conn)
-	defer func() {
-		_ = stmt.Close()
-	}()
-	_, err := stmt.Exec(nil)
+	_, err := conn.Exec(sqlText)
 	if err != nil {
 		return err
 	}
@@ -32,45 +30,27 @@ func createUDT(conn *go_ora.Connection) error {
 	return nil
 }
 
-func queryUDT(conn *go_ora.Connection) error {
+func queryUDT(conn *sql.DB) error {
 	t := time.Now()
-	stmt := go_ora.NewStmt("SELECT TEST_TYPE1(10, 'NAME') FROM DUAL", conn)
-	defer func() {
-		_ = stmt.Close()
-	}()
-	rows, err := stmt.Query(nil)
+	var test test1
+	err := conn.QueryRow("SELECT TEST_TYPE1(10, 'NAME') FROM DUAL").Scan(&test)
 	if err != nil {
 		return err
-	}
-	var (
-		test test1
-	)
-	if oraRows, ok := rows.(*go_ora.DataSet); ok {
-		for oraRows.Next_() {
-			err = oraRows.Scan(&test)
-			if err != nil {
-				return err
-			}
-		}
-		fmt.Println(test)
 	}
 	fmt.Println("Finish query UDT: ", time.Now().Sub(t))
 	return nil
 }
 
-func dropUDT(conn *go_ora.Connection) error {
+func dropUDT(conn *sql.DB) error {
 	t := time.Now()
-	stmt := go_ora.NewStmt("drop type TEST_TYPE1", conn)
-	defer func() {
-		_ = stmt.Close()
-	}()
-	_, err := stmt.Exec(nil)
+	_, err := conn.Exec("drop type TEST_TYPE1")
 	if err != nil {
 		return err
 	}
 	fmt.Println("Finish drop UDT: ", time.Now().Sub(t))
 	return nil
 }
+
 func usage() {
 	fmt.Println()
 	fmt.Println("user defined type")
@@ -86,9 +66,7 @@ func usage() {
 }
 
 func main() {
-	var (
-		server string
-	)
+	var server string
 
 	flag.StringVar(&server, "server", "", "Server's URL, oracle://user:pass@server/service_name")
 	flag.Parse()
@@ -100,15 +78,9 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("Connection string: ", connStr)
-	conn, err := go_ora.NewConnection(connStr)
+	conn, err := sql.Open("oracle", connStr)
 	if err != nil {
 		fmt.Println("Can't open driver", err)
-		return
-	}
-
-	err = conn.Open()
-	if err != nil {
-		fmt.Println("Can't open connection", err)
 		return
 	}
 
@@ -129,7 +101,7 @@ func main() {
 			fmt.Println("Can't drop UDT", err)
 		}
 	}()
-	err = conn.RegisterType("TEST_TYPE1", "", test1{})
+	err = go_ora.RegisterType(conn, "TEST_TYPE1", "", test1{})
 	if err != nil {
 		fmt.Println("Can't register UDT", err)
 		return
